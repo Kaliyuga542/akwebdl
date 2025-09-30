@@ -14,6 +14,8 @@ import json
 import shutil
 import tempfile
 import asyncio
+import threading
+from http.server import BaseHTTPRequestHandler, HTTPServer
 from pathlib import Path
 from functools import partial
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
@@ -39,7 +41,17 @@ TG_MAX_BYTES = 2 * 1024 * 1024 * 1024
 SESSIONS = {}  # user_id -> dict with session state
 
 # ---------- Helpers ----------
+def run_health_server():
+    class Handler(BaseHTTPRequestHandler):
+        def do_GET(self):
+            self.send_response(200)
+            self.end_headers()
+            self.wfile.write(b"ok")
+    server = HTTPServer(("0.0.0.0", 8000), Handler)
+    server.serve_forever()
 
+threading.Thread(target=run_health_server, daemon=True).start()
+    
 def run_cmd_sync(cmd, cwd=None, env=None, timeout=None):
     """Run blocking subprocess in synchronous context (used via executor)."""
     import subprocess
