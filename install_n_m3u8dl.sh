@@ -1,10 +1,16 @@
 #!/bin/bash
 set -e
 
-# Install N_m3u8DL-RE if not present
-if [ ! -f /usr/local/bin/N_m3u8DL-RE ]; then
-    wget https://github.com/nilaoda/N_m3u8DL-RE/releases/latest/download/N_m3u8DL-RE-linux-x64 -O /usr/local/bin/N_m3u8DL-RE
-    chmod +x /usr/local/bin/N_m3u8DL-RE
-fi
+# Create bin folder inside project
+mkdir -p bin
+cd bin
 
-python3 main.py
+# Download latest release (Linux x64)
+wget -O N_m3u8DL-RE.zip https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.0/N_m3u8DL-RE_Beta_linux-x64.zip
+
+# Unzip and set permission
+unzip -o N_m3u8DL-RE.zip
+chmod +x N_m3u8DL-RE
+
+# Go back to project root
+cd ..
