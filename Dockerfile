@@ -1,18 +1,30 @@
+# Use lightweight Python image
 FROM python:3.11-slim
 
+# Set working directory
 WORKDIR /app
 
-# Install dependencies
-COPY requirements.txt .
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    wget \
+    unzip \
+    ffmpeg \
+    && rm -rf /var/lib/apt/lists/*
+
+# Copy requirements first (for caching)
+COPY requirements.txt /app/
+
+# Install Python dependencies
 RUN pip install --no-cache-dir -r requirements.txt
 
+# Copy rest of the code
+COPY . /app/
+
 # Install N_m3u8DL-RE
-RUN apt-get update && apt-get install -y wget && \
-    wget https://github.com/nilaoda/N_m3u8DL-RE/releases/latest/download/N_m3u8DL-RE-linux-x64 -O /usr/local/bin/N_m3u8DL-RE && \
-    chmod +x /usr/local/bin/N_m3u8DL-RE && \
-    apt-get clean && rm -rf /var/lib/apt/lists/*
+RUN chmod +x install_n_m3u8dl.sh && ./install_n_m3u8dl.sh
 
-# Copy bot code
-COPY . .
+# Ensure binary is executable
+RUN chmod +x /app/bin/N_m3u8DL-RE
 
+# Run the bot
 CMD ["python", "main.py"]
