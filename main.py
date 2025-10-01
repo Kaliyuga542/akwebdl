@@ -53,26 +53,25 @@ def run_health_server():
 threading.Thread(target=run_health_server, daemon=True).start()
     
 def run_cmd_sync(cmd, cwd=None, env=None, timeout=None):
-    """Run blocking subprocess in synchronous context (used via executor)."""
-    import subprocess
-    proc = subprocess.run(cmd, capture_output=True, text=True, cwd=cwd, env=env, timeout=timeout)
-    return proc
+    proc = subprocess.run(
+        cmd,
+        capture_output=True,
+        text=True,
+        cwd=cwd,
+        env=env,
+        timeout=timeout
+    )
+    # stdout + stderr ಎರಡನ್ನೂ ಸೇರಿಸಿ
+    output = proc.stdout + proc.stderr
+    return output, proc.returncode
 
-def nm_info_json(link):
-    """Run N_m3u8DL-RE --get-info-json and return parsed JSON (or None)."""
-    cmd = [NM3U8DL_PATH, link, "--get-info-json"]
-    if DECRYPTION_KEY:
-        # If user has provided a legit key, append as an option — this assumes N_m3u8DL-RE supports something like --key (adjust if needed)
-        # NOTE: DO NOT use this to bypass DRM. Only if you legally have the key.
-        cmd += ["--key", DECRYPTION_KEY]
-    proc = run_cmd_sync(cmd)
-    if proc.returncode != 0:
-        return None, proc.stderr
-    try:
-        info = json.loads(proc.stdout)
-        return info, None
-    except Exception as e:
-        return None, f"JSON parse error: {e}"
+def nm_info_json(url):
+    # binary path set ಮಾಡಿ (repo/bin/N_m3u8DL-RE)
+    bin_path = os.path.join(os.getcwd(), "bin", "N_m3u8DL-RE")
+    cmd = [bin_path, url, "--json"]
+
+    output, code = run_cmd_sync(cmd)
+    return output, code
 
 def build_quality_buttons(info):
     """Build list of (video, audio) tuples based on info JSON."""
