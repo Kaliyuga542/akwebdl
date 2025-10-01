@@ -1,297 +1,233 @@
-#!/usr/bin/env python3
-"""
-main.py - Telegram bot to analyze MPD/m3u8, let user choose quality,
-download with N_m3u8DL-RE, support partial (hh:mm:ss) downloads,
-and upload to Telegram (auto-split >2GB).
-
-IMPORTANT: This script DOES NOT help bypass DRM. If you have a legal
-decryption key, you may set the DECRYPTION_KEY env var. Do NOT use this
-to obtain keys illegally.
-"""
-
+# main.py
 import os
-import json
-import shutil
-import tempfile
+import subprocess
 import asyncio
-import threading
-from http.server import BaseHTTPRequestHandler, HTTPServer
-from pathlib import Path
-from functools import partial
-from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup, InputFile
+import requests
+import logging
+from telegram import Update
 from telegram.ext import (
     Application,
-    CommandHandler,
     MessageHandler,
-    CallbackQueryHandler,
-    ContextTypes,
     filters,
+    ContextTypes,
+    CommandHandler,
 )
 
-# ---------- Configuration (prefer env vars) ----------
-BOT_TOKEN = os.getenv("BOT_TOKEN", "7963130483:AAF7jKH05kIlMozC42MAlHFM98ki_YBWYjY")
-NM3U8DL_PATH = os.getenv("NM3U8DL_PATH", "/usr/local/bin/N_m3u8DL-RE")
-DOWNLOAD_DIR = os.getenv("DOWNLOAD_DIR", "/tmp")
-DECRYPTION_KEY = os.getenv("DECRYPTION_KEY", None)  # Optional: ONLY use if you own it
+# ---------- CONFIG ----------
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+if not BOT_TOKEN:
+    raise RuntimeError("BOT_TOKEN environment variable is not set.")
 
-# Telegram per-file limit (regular bots): 2GB
-TG_MAX_BYTES = 2 * 1024 * 1024 * 1024
+CHUNK_SIZE = 1900 * 1024 * 1024  # 1.9 GB chunks
+TEMP_DIR = "./tmp_stream"
+os.makedirs(TEMP_DIR, exist_ok=True)
 
-# In-memory session store (simple)
-SESSIONS = {}  # user_id -> dict with session state
+# simple in-memory user state (non-persistent)
+user_state = {}  # {chat_id: {"expecting": "license_confirm", "url": "..."}}
 
-# ---------- Helpers ----------
-def run_health_server():
-    class Handler(BaseHTTPRequestHandler):
-        def do_GET(self):
-            self.send_response(200)
-            self.end_headers()
-            self.wfile.write(b"ok")
-    server = HTTPServer(("0.0.0.0", 8000), Handler)
-    server.serve_forever()
+# logging
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
 
-threading.Thread(target=run_health_server, daemon=True).start()
-    
-def run_cmd_sync(cmd, cwd=None, env=None, timeout=None):
-    proc = subprocess.run(
-        cmd,
-        capture_output=True,
-        text=True,
-        cwd=cwd,
-        env=env,
-        timeout=timeout
-    )
-    # stdout + stderr ಎರಡನ್ನೂ ಸೇರಿಸಿ
-    output = proc.stdout + proc.stderr
-    return output, proc.returncode
 
-def nm_info_json(url):
-    # binary path set ಮಾಡಿ (repo/bin/N_m3u8DL-RE)
-    bin_path = os.path.join(os.getcwd(), "bin", "N_m3u8DL-RE")
-    cmd = [bin_path, url, "--json"]
-
-    output, code = run_cmd_sync(cmd)
-    return output, code
-
-def build_quality_buttons(info):
-    """Build list of (video, audio) tuples based on info JSON."""
-    video_list = info.get("video", [])
-    audio_list = info.get("audio", [])
-    # Prepare buttons: show resolution/bitrate + audio codec
-    rows = []
-    for v in video_list:
-        vlabel = v.get("resolution") or str(v.get("bitrate") or "")
-        for a in audio_list:
-            alabel = a.get("codec") or str(a.get("bitrate") or "")
-            rows.append([InlineKeyboardButton(f"{vlabel} / {alabel}", callback_data=f"Q|{vlabel}|{alabel}")])
-    return InlineKeyboardMarkup(rows)
-
-def parse_hms_to_seconds(hms: str):
-    parts = hms.strip().split(":")
-    if len(parts) != 3:
-        raise ValueError("Format should be hh:mm:ss")
-    h, m, s = map(int, parts)
-    return h * 3600 + m * 60 + s
-
-def split_file_if_needed(path: Path):
-    """If file > TG_MAX_BYTES, split it into parts in same directory and return list of paths."""
-    size = path.stat().st_size
-    if size <= TG_MAX_BYTES:
-        return [path]
-    parts = []
-    chunk = TG_MAX_BYTES
-    idx = 1
-    with open(path, "rb") as f:
-        while True:
-            data = f.read(chunk)
-            if not data:
-                break
-            part_path = path.with_suffix(path.suffix + f".part{idx}")
-            with open(part_path, "wb") as p:
-                p.write(data)
-            parts.append(part_path)
-            idx += 1
-    # remove original big file after splitting to free disk
+# ---------- DRM detection helpers ----------
+def fetch_head(url: str, max_bytes: int = 4096) -> str:
+    """Fetch a small portion (or full manifest if small) for inspection."""
     try:
-        path.unlink()
+        # Try Range header to get small portion without fetching entire media
+        headers = {"Range": f"bytes=0-{max_bytes}"}
+        resp = requests.get(url, headers=headers, timeout=10)
+        if resp.status_code in (200, 206):
+            return resp.text.lower()
+        # fallback to full GET if Range not supported
+        resp = requests.get(url, timeout=10)
+        return resp.text.lower() if resp.status_code == 200 else ""
+    except Exception as e:
+        logger.warning("fetch_head error for %s: %s", url, str(e))
+        return ""
+
+
+def is_drm_manifest(url: str) -> bool:
+    """Heuristic checks for DRM indicators in mpd or m3u8 manifests."""
+    content = fetch_head(url)
+    if not content:
+        return False
+
+    # MPD/DASH DRM clues
+    if "cenc:default_kid" in content or "pssh" in content or "protection" in content or "widevine" in content:
+        return True
+
+    # HLS DRM clues
+    if "#ext-x-key" in content or "sample-aes" in content or "encryption" in content:
+        return True
+
+    return False
+
+
+# ---------- streaming + chunking helpers ----------
+async def stream_and_upload_parts(update: Update, url: str):
+    """
+    Stream the manifest via ffmpeg and upload in CHUNK_SIZE parts.
+    Uses run_in_executor for blocking IO to avoid blocking the event loop.
+    """
+    chat_id = update.effective_chat.id
+    bot = update.message.bot
+    await update.message.reply_text("📥 Streaming download started (pipe → chunked upload)...")
+
+    # ffmpeg command: input manifest, copy streams to MP4 container, pipe to stdout
+    cmd = ["ffmpeg", "-y", "-i", url, "-c", "copy", "-f", "mp4", "pipe:1"]
+
+    # start ffmpeg subprocess
+    try:
+        process = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, bufsize=10 ** 8
+        )
+    except FileNotFoundError:
+        await update.message.reply_text("❌ ffmpeg not found in container. Please install ffmpeg.")
+        return
+    except Exception as e:
+        await update.message.reply_text(f"❌ Failed to start ffmpeg: {str(e)}")
+        return
+
+    loop = asyncio.get_running_loop()
+    part = 1
+
+    try:
+        while True:
+            # read a chunk from ffmpeg stdout in a thread to avoid blocking
+            chunk = await loop.run_in_executor(None, process.stdout.read, CHUNK_SIZE)
+            if not chunk:
+                break
+
+            tmp_name = os.path.join(TEMP_DIR, f"part_{chat_id}_{part}.mp4")
+
+            # write chunk to temp file in thread
+            await loop.run_in_executor(None, _write_bytes_to_file, tmp_name, chunk)
+
+            # notify and upload
+            await update.message.reply_text(f"⬆️ Uploading part {part} ...")
+            try:
+                # upload as document (safer for large files)
+                with open(tmp_name, "rb") as fp:
+                    await bot.send_document(chat_id=chat_id, document=fp, filename=os.path.basename(tmp_name))
+            except Exception as e:
+                await update.message.reply_text(f"❌ Upload failed for part {part}: {str(e)}")
+                # continue cleanup and try next or abort
+                logger.exception("Upload failed")
+                # Best effort: remove file then break
+                await loop.run_in_executor(None, _safe_remove, tmp_name)
+                break
+
+            # cleanup part after upload
+            await loop.run_in_executor(None, _safe_remove, tmp_name)
+            part += 1
+
+        # wait for ffmpeg to finish
+        await loop.run_in_executor(None, process.stdout.close)
+        await loop.run_in_executor(None, process.stderr.close)
+        await loop.run_in_executor(None, process.wait)
+        await update.message.reply_text("✅ All parts uploaded successfully.")
+    except Exception as e:
+        logger.exception("stream_and_upload_parts error")
+        try:
+            process.kill()
+        except Exception:
+            pass
+        await update.message.reply_text(f"❌ Streaming/upload error: {str(e)}")
+
+
+def _write_bytes_to_file(path: str, data: bytes):
+    """Blocking helper to write bytes to a file."""
+    with open(path, "wb") as f:
+        f.write(data)
+
+
+def _safe_remove(path: str):
+    """Blocking helper to remove a file quietly."""
+    try:
+        if os.path.exists(path):
+            os.remove(path)
     except Exception:
-        pass
-    return parts
+        logger.exception("Failed to remove %s", path)
 
-def build_nmd_cmd(link, output_name, video_sel=None, audio_sel=None, duration_seconds=None):
-    """
-    Build N_m3u8DL-RE command.
-    Note: Adjust arguments if your N_m3u8DL-RE uses different flags for stream selection.
-    """
-    cmd = [NM3U8DL_PATH, link, "--save-name", output_name, "--auto-select"]
-    # If a decryption key is provided externally and supported, attach it (only if you have legal rights)
-    if DECRYPTION_KEY:
-        cmd += ["--key", DECRYPTION_KEY]
-    if duration_seconds:
-        cmd += ["--download-seconds", str(duration_seconds)]
-    # --video-bitrate / --audio-bitrate placeholders: N_m3u8DL-RE accepts track selection options which depend on version
-    # We include them only if user provided simple labels (the real tool may require different flags). Keep as-is or adapt.
-    if video_sel:
-        cmd += ["--video-bitrate", str(video_sel)]
-    if audio_sel:
-        cmd += ["--audio-bitrate", str(audio_sel)]
-    return cmd
 
-# ---------- Telegram handlers ----------
+# ---------- Handlers ----------
+async def start_cmd(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(
+        "Hello! Send an mpd or m3u8 link and I'll attempt a streaming download and chunked upload (non-DRM only)."
+    )
 
-async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Send an MPD or M3U8 URL and I'll analyze available qualities. (I cannot download DRM-protected content without legal keys.)")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    user_id = update.effective_user.id
     text = (update.message.text or "").strip()
-    if not text:
-        await update.message.reply_text("Please send a text MPD or M3U8 URL.")
-        return
+    chat_id = update.effective_chat.id
 
-    # If we're waiting for duration input
-    sess = SESSIONS.get(user_id)
-    if sess and sess.get("awaiting_duration"):
-        # Expect hh:mm:ss or 'full'
-        if text.lower() == "full":
-            duration_seconds = None
+    # check if user was asked about license possession
+    state = user_state.get(chat_id, {})
+    expecting = state.get("expecting")
+
+    # If expecting confirmation about license/keys after DRM detection
+    if expecting == "license_confirm":
+        lower = text.lower()
+        if lower in ("yes", "y", "ha", "ಹೌದು"):
+            # user claims to have license/keys — we refuse to decrypt but offer guidance
+            await update.message.reply_text(
+                "ನೋಟ್: ನಾನು DRM decrypt/keys ಬಳಸಿ content download ಮಾಡಲು ಸಹಾಯ ಮಾಡಲ್ಲ.\n\n"
+                "ನಿಮ್ಮಲ್ಲಿ license server / keys ಇದ್ದರೆ, authorized playback (ExoPlayer/Shaka) integration ಮತ್ತು server-side license-request flow ನಲ್ಲಿ ಸಹಾಯ ಮಾಡಬಹುದು.\n"
+                "ಅಥವಾ content owner/ distributor ನಿಂದ authorized export/API ಕೇಳಿ.\n\n"
+                "ನೀವು authorization integration ಕುರಿತು உதவி ಕೇಳಿದರೆ ನಾನು high-level code samples ಕೊಡುತ್ತೇನೆ."
+            )
+            user_state.pop(chat_id, None)
+            return
         else:
-            try:
-                duration_seconds = parse_hms_to_seconds(text)
-            except Exception:
-                await update.message.reply_text("Invalid format. Send duration as hh:mm:ss (e.g., 00:05:30) or 'full'.")
+            # user said NO — proceed with non-DRM streaming attempt
+            url = state.get("url")
+            user_state.pop(chat_id, None)
+            if not url:
+                await update.message.reply_text("Bad state: URL missing. Please resend the link.")
                 return
-        sess["duration_seconds"] = duration_seconds
-        sess["awaiting_duration"] = False
-        # Kick off download in background
-        await update.message.reply_text("Starting download (this may take a while)…")
-        asyncio.create_task(do_download_and_upload(update, context, user_id))
-        return
-
-    # New incoming link - validate
-    if not ("mpd" in text.lower() or "m3u8" in text.lower() or text.startswith("http")):
-        await update.message.reply_text("Please send a valid MPD or M3U8 URL (http/https...).")
-        return
-
-    # Analyze link for qualities (this is blocking; run in executor)
-    await update.message.reply_text("Analyzing manifest for available qualities…")
-    loop = asyncio.get_running_loop()
-    info, err = await loop.run_in_executor(None, partial(nm_info_json, text))
-    if not info:
-        await update.message.reply_text(f"Failed to analyze link. Error: {err or 'unknown'}")
-        return
-
-    # Save session
-    SESSIONS[user_id] = {"link": text, "info": info}
-
-    # Build and send quality buttons
-    kb = build_quality_buttons(info)
-    if not kb.inline_keyboard:
-        await update.message.reply_text("No qualities found in manifest.")
-        return
-    await update.message.reply_text("Select video/audio quality:", reply_markup=kb)
-
-async def button_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    query = update.callback_query
-    await query.answer()
-    user_id = query.from_user.id
-    payload = query.data
-    if not payload:
-        await query.edit_message_text("Invalid selection.")
-        return
-    parts = payload.split("|")
-    if parts[0] != "Q" or len(parts) < 3:
-        await query.edit_message_text("Invalid quality payload.")
-        return
-
-    video_sel = parts[1]
-    audio_sel = parts[2]
-    sess = SESSIONS.get(user_id)
-    if not sess:
-        await query.edit_message_text("Session expired. Send link again.")
-        return
-
-    sess["video_sel"] = video_sel
-    sess["audio_sel"] = audio_sel
-    sess["awaiting_duration"] = True
-    # ask for duration
-    await query.edit_message_text("Choose download mode:\n- Send duration in hh:mm:ss (e.g., 00:05:00)\n- Or send 'full' to download full video")
-
-async def do_download_and_upload(update: Update, context: ContextTypes.DEFAULT_TYPE, user_id: int):
-    """
-    Perform the N_m3u8DL-RE download (in background), split if needed and upload to Telegram.
-    This function runs asynchronously but offloads blocking subprocess calls to an executor.
-    """
-    sess = SESSIONS.get(user_id)
-    if not sess:
-        return
-    link = sess.get("link")
-    video_sel = sess.get("video_sel")
-    audio_sel = sess.get("audio_sel")
-    duration_seconds = sess.get("duration_seconds")
-
-    # Prepare safe output dir
-    tmpdir = Path(tempfile.mkdtemp(prefix="bot_dl_"))
-    output_name = "video"  # base
-    output_file = tmpdir / f"{output_name}.mp4"
-
-    cmd = build_nmd_cmd(link, output_name, video_sel=video_sel, audio_sel=audio_sel, duration_seconds=duration_seconds)
-    # Run blocking download in executor
-    loop = asyncio.get_running_loop()
-    await context.bot.send_message(chat_id=user_id, text=f"Downloading using: {' '.join(cmd[:6])} ...")
-    try:
-        proc = await loop.run_in_executor(None, partial(run_cmd_sync, cmd, tmpdir))
-        if proc.returncode != 0:
-            err = proc.stderr or "Unknown error"
-            await context.bot.send_message(chat_id=user_id, text=f"Download failed: {err[:1000]}")
-            shutil.rmtree(tmpdir, ignore_errors=True)
-            SESSIONS.pop(user_id, None)
+            await update.message.reply_text("Proceeding with non-DRM streaming download...")
+            await stream_and_upload_parts(update, url)
             return
 
-        if not output_file.exists():
-            # N_m3u8DL-RE may save with another name; attempt to find largest file in tmpdir
-            files = list(tmpdir.glob("*"))
-            if not files:
-                await context.bot.send_message(chat_id=user_id, text="Download finished but no output file found.")
-                shutil.rmtree(tmpdir, ignore_errors=True)
-                SESSIONS.pop(user_id, None)
-                return
-            # pick largest file
-            output_file = max(files, key=lambda p: p.stat().st_size)
+    # Normal incoming text -> detect links
+    if text.endswith(".mpd") or text.endswith(".m3u8") or "m3u8" in text or "mpd" in text:
+        url = text
+        await update.message.reply_text("🔎 Inspecting manifest for DRM indicators...")
+        try:
+            drm = is_drm_manifest(url)
+        except Exception as e:
+            logger.exception("DRM detection error")
+            drm = False
 
-        # Now split if needed
-        parts = split_file_if_needed(output_file)
-        # Upload each part
-        for idx, part in enumerate(parts, start=1):
-            caption = f"Part {idx}/{len(parts)}" if len(parts) > 1 else None
-            await context.bot.send_message(chat_id=user_id, text=f"Uploading {part.name} ({part.stat().st_size // (1024*1024)} MB)...")
-            # Use InputFile; open in binary
-            with open(part, "rb") as fh:
-                # send_document is async; keep it awaited
-                await context.bot.send_document(chat_id=user_id, document=InputFile(fh, filename=part.name), caption=caption)
-            # Remove part after upload to free space
-            try:
-                Path(part).unlink()
-            except Exception:
-                pass
+        if drm:
+            # Ask user if they legally have keys/license (we still won't decrypt)
+            user_state[chat_id] = {"expecting": "license_confirm", "url": url}
+            await update.message.reply_text(
+                "⚠️ This stream appears to be DRM-protected.\n"
+                "Do you have a legal license/key for this content? Reply YES if you do (note: I WILL NOT use keys to decrypt),\n"
+                "or reply NO to attempt non-DRM download (if possible)."
+            )
+            return
+        else:
+            # Not DRM -> proceed streaming+upload
+            await update.message.reply_text("No DRM detected — starting streaming download/upload...")
+            await stream_and_upload_parts(update, url)
+            return
 
-        await context.bot.send_message(chat_id=user_id, text="All done ✅")
-    except Exception as e:
-        await context.bot.send_message(chat_id=user_id, text=f"Unexpected error: {e}")
-    finally:
-        shutil.rmtree(tmpdir, ignore_errors=True)
-        SESSIONS.pop(user_id, None)
+    # fallback
+    await update.message.reply_text("Send an mpd or m3u8 link (plain URL).")
+
 
 # ---------- Main ----------
 def main():
-    if not shutil.which(NM3U8DL_PATH):
-        print(f"Warning: N_m3u8DL-RE not found at {NM3U8DL_PATH}. Ensure the binary is installed and path is correct.")
     app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(CommandHandler("start", start_handler))
+    app.add_handler(CommandHandler("start", start_cmd))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.add_handler(CallbackQueryHandler(button_handler))
-    print("Bot started.")
+
+    # Run polling (if you deploy with webhook, change accordingly)
     app.run_polling()
+
 
 if __name__ == "__main__":
     main()
