@@ -6,7 +6,7 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")  # optional fixed chat
-NM_PATH = "/usr/local/bin/N_m3u8DL-RE"
+NM_PATH = "N_m3u8DL-RE"   # system PATH already has /usr/local/bin
 MAX_SPLIT_SIZE = 2000 * 1024 * 1024  # 2000 MB split
 
 async def run_cmd(cmd):
