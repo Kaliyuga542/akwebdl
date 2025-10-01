@@ -65,7 +65,8 @@ def is_drm_manifest(url: str) -> bool:
 
 
 # ---------- streaming + chunking helpers ----------
-async def stream_and_upload_parts(update: Update, url: str):
+async def stream_and_upload_parts(update: Update, context: ContextTypes.DEFAULT_TYPE, url: str):
+    bot = context.bot  # <-- v20+ correct way
     """
     Stream the manifest via ffmpeg and upload in CHUNK_SIZE parts.
     Uses run_in_executor for blocking IO to avoid blocking the event loop.
