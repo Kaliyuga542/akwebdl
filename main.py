@@ -1,97 +1,39 @@
-import os
 import asyncio
-import glob
 from telegram import Update
-from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, filters, ContextTypes
+import os
+import subprocess
 
+BOT_TOKEN = os.getenv("BOT_TOKEN")  # set in environment
 
-# BOT TOKEN from environment
-BOT_TOKEN = os.getenv("BOT_TOKEN")
-if not BOT_TOKEN:
-    raise ValueError("⚠️ BOT_TOKEN not set. Please configure it as environment variable.")
-
-# -------------------------------
-# Run shell command
-# -------------------------------
-async def run_cmd(cmd, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text(f"⚡ Running: {' '.join(cmd)}")
-
+# Run shell command async
+async def run_cmd(cmd: list[str]) -> str:
     process = await asyncio.create_subprocess_exec(
-        *cmd,
-        stdout=asyncio.subprocess.PIPE,
-        stderr=asyncio.subprocess.PIPE
+        *cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE
     )
-
     stdout, stderr = await process.communicate()
+    return stdout.decode() + stderr.decode()
 
-    if process.returncode == 0:
-        await update.message.reply_text("✅ Download finished successfully!")
-        return True, stdout.decode(), stderr.decode()
-    else:
-        await update.message.reply_text(f"❌ Download failed:\n{stderr.decode()}")
-        return False, stdout.decode(), stderr.decode()
-
-
-# -------------------------------
-# Download + Upload
-# -------------------------------
-async def download_and_upload(url, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    save_name = "video"
-    cmd = [
-        "/usr/local/bin/N_m3u8DL-RE",
-        url,
-        "--save-name", save_name,
-        "--auto-select",
-        "--binary-merge"
-    ]
-
-    success, stdout, stderr = await run_cmd(cmd, update, context)
-
-    if success:
-        output_files = glob.glob(f"{save_name}.*")
-
-        if output_files:
-            file_path = output_files[0]
-            await update.message.reply_text("📤 Uploading file to Telegram...")
-
-            try:
-                with open(file_path, "rb") as f:
-                    await update.message.reply_document(document=f)
-                await update.message.reply_text("✅ Upload complete!")
-
-                # Auto delete after upload (to save space)
-                os.remove(file_path)
-            except Exception as e:
-                await update.message.reply_text(f"⚠️ Upload failed: {str(e)}")
-        else:
-            await update.message.reply_text("⚠️ No output file found after download!")
-
-
-# -------------------------------
-# Handlers
-# -------------------------------
+# Start command
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("👋 Hi! Send me an m3u8 or mpd link and I’ll download it for you.")
+    await update.message.reply_text("👋 Hello! Send me an m3u8/dash link and I’ll try to download it!")
 
+# Handle messages (links)
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    text = update.message.text.strip()
-    if text.startswith("http"):
-        await download_and_upload(text, update, context)
+    url = update.message.text.strip()
+    if url.startswith("http"):
+        await update.message.reply_text(f"⚡ Running: {url}")
+        cmd = ["/usr/local/bin/N_m3u8DL-RE", url, "--save-name", "video", "--auto-select", "--binary-merge"]
+        output = await run_cmd(cmd)
+        await update.message.reply_text(f"✅ Done!\n\nOutput:\n{output[:4000]}")
     else:
-        await update.message.reply_text("⚠️ Please send a valid URL.")
+        await update.message.reply_text("❌ Not a valid URL!")
 
-
-# -------------------------------
-# Main
-# -------------------------------
 def main():
-    app = Application.builder().token(BOT_TOKEN).build()
-
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-
     app.run_polling()
-
 
 if __name__ == "__main__":
     main()
