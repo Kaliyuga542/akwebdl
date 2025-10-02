@@ -13,7 +13,6 @@ os.makedirs(DOWNLOAD_PATH, exist_ok=True)
 # Path to N_m3u8DL-RE (installed in Dockerfile)
 NM3U8DL_PATH = "/usr/local/bin/N_m3u8DL-RE"
 
-
 def download_mpd(mpd_url, output_name="video"):
     output_file = os.path.join(DOWNLOAD_PATH, output_name + ".mp4")
     cmd = [
