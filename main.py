@@ -6,7 +6,7 @@ from telegram.ext import Application, MessageHandler, filters, ContextTypes
 
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 CHAT_ID = os.getenv("CHAT_ID")  # optional fixed chat
-NM_PATH = "N_m3u8DL-RE"   # system PATH already has /usr/local/bin
+NM_PATH = "/usr/local/bin/N_m3u8DL-RE"
 MAX_SPLIT_SIZE = 2000 * 1024 * 1024  # 2000 MB split
 
 async def run_cmd(cmd, update, context):
@@ -55,7 +55,7 @@ async def split_file(filepath):
     return parts
 
 async def download_and_upload(url, update, context):
-    cmd = ["N_m3u8DL-RE", url, "--save-name", "video", "--auto-select", "--binary-merge"]
+    cmd = [NM_PATH, url, "--save-name", "video", "--auto-select", "--binary-merge"]
 
     await update.message.reply_text(f"⚡ Running: {' '.join(cmd)}")
 
