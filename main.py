@@ -1,95 +1,97 @@
 import os
 import asyncio
-import requests
+import glob
 from telegram import Update
-from telegram.ext import Application, MessageHandler, filters, ContextTypes
+from telegram.ext import Application, CommandHandler, MessageHandler, ContextTypes, filters
 
+
+# BOT TOKEN from environment
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-CHAT_ID = os.getenv("CHAT_ID")  # optional fixed chat
-NM_PATH = "/usr/local/bin/N_m3u8DL-RE"
-MAX_SPLIT_SIZE = 2000 * 1024 * 1024  # 2000 MB split
+if not BOT_TOKEN:
+    raise ValueError("⚠️ BOT_TOKEN not set. Please configure it as environment variable.")
 
-async def run_cmd(cmd, update, context):
+# -------------------------------
+# Run shell command
+# -------------------------------
+async def run_cmd(cmd, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"⚡ Running: {' '.join(cmd)}")
+
     process = await asyncio.create_subprocess_exec(
         *cmd,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE
     )
 
-    # Read output line by line
-    while True:
-        line = await process.stdout.readline()
-        if not line:
-            break
-        text = line.decode().strip()
-        if text:
-            try:
-                await update.message.reply_text(f"📥 {text}")
-            except:
-                pass
+    stdout, stderr = await process.communicate()
 
-    await process.wait()
-    return process.returncode == 0
+    if process.returncode == 0:
+        await update.message.reply_text("✅ Download finished successfully!")
+        return True, stdout.decode(), stderr.decode()
+    else:
+        await update.message.reply_text(f"❌ Download failed:\n{stderr.decode()}")
+        return False, stdout.decode(), stderr.decode()
 
-async def split_file(filepath):
-    size = os.path.getsize(filepath)
-    if size <= MAX_SPLIT_SIZE:
-        return [filepath]
 
-    parts = []
-    base = filepath.rsplit(".", 1)[0]
-    ext = filepath.rsplit(".", 1)[-1]
+# -------------------------------
+# Download + Upload
+# -------------------------------
+async def download_and_upload(url, update: Update, context: ContextTypes.DEFAULT_TYPE):
+    save_name = "video"
+    cmd = [
+        "/usr/local/bin/N_m3u8DL-RE",
+        url,
+        "--save-name", save_name,
+        "--auto-select",
+        "--binary-merge"
+    ]
 
-    part_size = MAX_SPLIT_SIZE
-    i = 0
-    with open(filepath, "rb") as f:
-        while True:
-            chunk = f.read(part_size)
-            if not chunk:
-                break
-            part_file = f"{base}_part{i}.{ext}"
-            with open(part_file, "wb") as pf:
-                pf.write(chunk)
-            parts.append(part_file)
-            i += 1
-    return parts
-
-async def download_and_upload(url, update, context):
-    cmd = [NM_PATH, url, "--save-name", "video", "--auto-select", "--binary-merge"]
-
-    await update.message.reply_text(f"⚡ Running: {' '.join(cmd)}")
-
-    success = await run_cmd(cmd, update, context)
+    success, stdout, stderr = await run_cmd(cmd, update, context)
 
     if success:
-        await update.message.reply_text("✅ Download completed! Now uploading...")
-        # ಇಲ್ಲಿ split ಮಾಡಿ Telegram ಗೆ upload logic ಹಾಕಬೇಕು
-    else:
-        await update.message.reply_text("❌ Download failed!")
-        return
+        output_files = glob.glob(f"{save_name}.*")
 
-    # Find file
-    for f in os.listdir("."):
-        if f.startswith("video"):
-            filepath = f
-            break
+        if output_files:
+            file_path = output_files[0]
+            await update.message.reply_text("📤 Uploading file to Telegram...")
 
-    # Split if needed
-    parts = await split_file(filepath)
+            try:
+                with open(file_path, "rb") as f:
+                    await update.message.reply_document(document=f)
+                await update.message.reply_text("✅ Upload complete!")
 
-    for part in parts:
-        await update.message.reply_document(document=open(part, "rb"))
-        os.remove(part)
+                # Auto delete after upload (to save space)
+                os.remove(file_path)
+            except Exception as e:
+                await update.message.reply_text(f"⚠️ Upload failed: {str(e)}")
+        else:
+            await update.message.reply_text("⚠️ No output file found after download!")
+
+
+# -------------------------------
+# Handlers
+# -------------------------------
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Hi! Send me an m3u8 or mpd link and I’ll download it for you.")
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     text = update.message.text.strip()
     if text.startswith("http"):
         await download_and_upload(text, update, context)
     else:
-        await update.message.reply_text("⚠️ Please send a valid MPD/M3U8 link.")
+        await update.message.reply_text("⚠️ Please send a valid URL.")
+
+
+# -------------------------------
+# Main
+# -------------------------------
+def main():
+    app = Application.builder().token(BOT_TOKEN).build()
+
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+
+    app.run_polling()
+
 
 if __name__ == "__main__":
-    print("🤖 Bot started")
-    app = Application.builder().token(BOT_TOKEN).build()
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
-    app.run_polling()
+    main()
