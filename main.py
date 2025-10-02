@@ -9,16 +9,27 @@ CHAT_ID = os.getenv("CHAT_ID")  # optional fixed chat
 NM_PATH = "N_m3u8DL-RE"   # system PATH already has /usr/local/bin
 MAX_SPLIT_SIZE = 2000 * 1024 * 1024  # 2000 MB split
 
-async def run_cmd(cmd):
-    proc = await asyncio.create_subprocess_exec(
-        *cmd, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE
+async def run_cmd(cmd, update, context):
+    process = await asyncio.create_subprocess_exec(
+        *cmd,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE
     )
-    out, err = await proc.communicate()
-    if out:
-        print(out.decode())
-    if err:
-        print(err.decode())
-    return proc.returncode == 0
+
+    # Read output line by line
+    while True:
+        line = await process.stdout.readline()
+        if not line:
+            break
+        text = line.decode().strip()
+        if text:
+            try:
+                await update.message.reply_text(f"📥 {text}")
+            except:
+                pass
+
+    await process.wait()
+    return process.returncode == 0
 
 async def split_file(filepath):
     size = os.path.getsize(filepath)
@@ -43,18 +54,17 @@ async def split_file(filepath):
             i += 1
     return parts
 
-async def download_and_upload(url: str, update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Check for DRM key
-    if "drm=" in url:
-        url, key = url.split("drm=")
-        cmd = [NM_PATH, url.strip(), "--save-name", "video", "--auto-select", "--binary-merge", "--key", key.strip()]
-    else:
-        cmd = [NM_PATH, url.strip(), "--save-name", "video", "--auto-select", "--binary-merge"]
+async def download_and_upload(url, update, context):
+    cmd = ["N_m3u8DL-RE", url, "--save-name", "video", "--auto-select", "--binary-merge"]
 
     await update.message.reply_text(f"⚡ Running: {' '.join(cmd)}")
 
-    success = await run_cmd(cmd)
-    if not success:
+    success = await run_cmd(cmd, update, context)
+
+    if success:
+        await update.message.reply_text("✅ Download completed! Now uploading...")
+        # ಇಲ್ಲಿ split ಮಾಡಿ Telegram ಗೆ upload logic ಹಾಕಬೇಕು
+    else:
         await update.message.reply_text("❌ Download failed!")
         return
 
