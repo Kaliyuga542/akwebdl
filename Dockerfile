@@ -1,25 +1,24 @@
 FROM python:3.11-slim
 
+# Install system dependencies
+RUN apt-get update && apt-get install -y \
+    wget ffmpeg curl \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install N_m3u8DL-RE (latest release for Linux)
+RUN wget -O /usr/local/bin/N_m3u8DL-RE \
+    https://github.com/nilaoda/N_m3u8DL-RE/releases/latest/download/N_m3u8DL-RE_Linux \
+    && chmod +x /usr/local/bin/N_m3u8DL-RE
+
+# Set working directory
 WORKDIR /app
 
-# Install system dependencies
-RUN apt-get update && apt-get install -y wget unzip curl ffmpeg && rm -rf /var/lib/apt/lists/*
-
-# Install N_m3u8DL-RE
-RUN wget https://github.com/nilaoda/N_m3u8DL-RE/releases/download/v0.2.0/N_m3u8DL-RE_Linux_x64_Release.zip -O /tmp/nm3u8dl.zip \
-    && unzip /tmp/nm3u8dl.zip -d /tmp/nm3u8dl \
-    && mv /tmp/nm3u8dl/N_m3u8DL-RE /usr/local/bin/N_m3u8DL-RE \
-    && chmod +x /usr/local/bin/N_m3u8DL-RE \
-    && rm -rf /tmp/nm3u8dl /tmp/nm3u8dl.zip
-
-# Install Python dependencies
+# Copy requirements first (better caching)
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Copy source
+# Copy bot code
 COPY . .
 
-EXPOSE 8080
-
-# Run the bot
+# Run Telegram bot
 CMD ["python", "main.py"]
