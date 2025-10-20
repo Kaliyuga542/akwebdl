@@ -90,5 +90,13 @@ async def handle(_, message: Message):
         except Exception as e:
             await progress.edit_text(f"Failed to send file: {e}")
 
+async def main():
+    await asyncio.sleep(2)  # give time for container clock to sync
+    await app.start()
+    print("Bot started successfully ✅")
+    await idle()
+    await app.stop()
+
 if __name__ == "__main__":
-    app.run()
+    import asyncio
+    asyncio.run(main())
