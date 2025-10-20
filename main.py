@@ -1,132 +1,94 @@
-# main.py
-)
-elif d.get('status') == 'finished':
-asyncio.get_event_loop().create_task(
-progress_msg.edit_text("Download finished, preparing to send...")
-)
-except Exception:
-pass
+# main.py (recommended replacement)
+import os
+import tempfile
+import asyncio
+from pathlib import Path
+from pyrogram import Client, filters
+from pyrogram.types import Message
+from yt_dlp import YoutubeDL
+from config import BOT_TOKEN, API_ID, API_HASH, OWNER_ID, MAX_FILE_SIZE_MB
 
+app = Client("ott_bot",
+             bot_token=BOT_TOKEN,
+             api_id=int(API_ID),
+             api_hash=API_HASH)
 
-ytdl_opts['progress_hooks'] = [progress_hook]
-ytdl_opts['outtmpl'] = str(Path(download_dir) / "%(title).200s.%(ext)s")
+ALLOWED_DOMAINS = [
+    "hotstar.com", "disneyplus.com", "zee5.com", "sonyliv.com",
+    "mxplayer.in", "voot.com", "youtube.com", "youtu.be"
+]
 
+URL_PREFIX = ("http://", "https://")
+MAX_BYTES = int(MAX_FILE_SIZE_MB) * 1024 * 1024
 
-with YoutubeDL(ytdl_opts) as ytdl:
-info = ytdl.extract_info(url, download=False)
+def is_allowed_url(url: str) -> bool:
+    return any(domain in url for domain in ALLOWED_DOMAINS)
 
+def yt_download_blocking(url: str, out_dir: str) -> str:
+    opts = {
+        "format": "bestvideo+bestaudio/best",
+        "outtmpl": str(Path(out_dir) / "%(title).200s.%(ext)s"),
+        "noplaylist": True,
+        "quiet": True,
+        "no_warnings": True,
+    }
+    with YoutubeDL(opts) as ydl:
+        info = ydl.extract_info(url, download=False)
+        formats = info.get("formats") or []
+        if not formats:
+            raise RuntimeError("No downloadable formats (possible DRM)")
+        ydl.download([url])
+    files = list(Path(out_dir).glob("*"))
+    if not files:
+        raise RuntimeError("Downloaded but file not found")
+    latest = max(files, key=lambda p: p.stat().st_mtime)
+    return str(latest)
 
-# quick DRM-ish detection: if extractor or formats indicate encrypted/protected, abort
-# This is heuristic; yt-dlp may raise ExtractorError for truly unsupported/DRM content
-formats = info.get('formats') or []
-if not formats:
-raise RuntimeError("No downloadable formats detected (possible DRM or protected stream)")
-
-
-# start actual download
-result = ytdl.download([url])
-
-
-# find downloaded file in download_dir (most recent)
-files = list(Path(download_dir).glob('*'))
-if not files:
-raise RuntimeError("Download completed but file not found")
-
-
-latest = max(files, key=lambda p: p.stat().st_mtime)
-return str(latest)
-
-
-
-
-@app.on_message(filters.private & filters.command(['start', 'help']))
-async def start_cmd(client, message: Message):
-await message.reply_text(
-"Hello! Send me an OTT link (free/non-DRM). I will try to download and send the video.\n\n" \
-"⚠️ I cannot bypass DRM-protected content. If the link is DRM-protected the bot will report an error."
-)
-
-
-
+@app.on_message(filters.private & filters.command(["start", "help"]))
+async def start(_, message: Message):
+    await message.reply_text(
+        "Send a direct OTT/video URL (free/non-DRM). I try to download and send the file. I cannot bypass DRM."
+    )
 
 @app.on_message(filters.private & filters.text)
-async def handle_text(client, message: Message):
-text = message.text.strip()
-urls = URL_REGEX.findall(text)
-if not urls:
-await message.reply_text("Send a direct OTT/video URL.")
-return
+async def handle(_, message: Message):
+    text = message.text.strip()
+    # find URL simply
+    url = None
+    for token in text.split():
+        if token.startswith(URL_PREFIX):
+            url = token
+            break
+    if not url:
+        return await message.reply_text("Please send a direct URL.")
 
+    if not is_allowed_url(url):
+        return await message.reply_text("Domain not allowed. Add to ALLOWED_DOMAINS if needed.")
 
-url = urls[0]
-if not is_allowed_url(url):
-await message.reply_text("This domain is not in the allowed list. Add it to ALLOWED_DOMAINS in the code if needed.")
-return
+    progress = await message.reply_text("Starting download... (this may take a while)")
+    with tempfile.TemporaryDirectory() as tmp:
+        loop = asyncio.get_event_loop()
+        try:
+            # Run blocking downloader in executor
+            filepath = await loop.run_in_executor(None, yt_download_blocking, url, tmp)
+        except Exception as e:
+            await progress.edit_text(f"Download failed: {e}")
+            return
 
+        try:
+            size = Path(filepath).stat().st_size
+            if size > MAX_BYTES:
+                await progress.edit_text(
+                    f"File too large ({size//1024//1024} MB). Max is {MAX_FILE_SIZE_MB} MB. "
+                    "Consider external upload."
+                )
+                return
 
-progress = await message.reply_text("Preparing to download...")
+            await progress.edit_text("Uploading to Telegram...")
+            await app.send_document(message.chat.id, document=filepath, caption=f"From: {url}")
+            await progress.delete()
+        except Exception as e:
+            await progress.edit_text(f"Failed to send file: {e}")
 
-
-# Create a temporary directory
-with tempfile.TemporaryDirectory() as tmpdir:
-try:
-filepath = await asyncio.get_event_loop().run_in_executor(None, lambda: asyncio.run_coroutine_threadsafe(asyncio.to_thread(lambda: download_with_ytdl_sync(url, tmpdir, progress)), asyncio.get_event_loop()).result())
-except Exception as e:
-# fallback: run sync download in blocking executor using yt-dlp directly
-try:
-filepath = await asyncio.get_event_loop().run_in_executor(None, lambda: download_with_ytdl_sync_blocking(url, tmpdir, progress))
-except Exception as e2:
-await progress.edit_text(f"Failed to download: {e2}")
-return
-
-
-# check size
-try:
-size = Path(filepath).stat().st_size
-if size > MAX_BYTES:
-await progress.edit_text(f"Downloaded file is too large ({size//1024//1024} MB). Max is {MAX_FILE_SIZE_MB} MB.")
-# Optionally: upload to external hosting here
-return
-
-
-await progress.edit_text("Uploading to Telegram...")
-await client.send_document(message.chat.id, document=filepath, caption=f"Downloaded from: {url}")
-await progress.delete()
-except Exception as e:
-await progress.edit_text(f"Error sending file: {e}")
-
-
-
-
-# Helper synchronous wrappers to use yt-dlp in executors
-from yt_dlp import YoutubeDL, DownloadError
-
-
-def download_with_ytdl_sync_blocking(url: str, download_dir: str, progress_msg: Message):
-ytdl_opts = YTDL_OPTS_BASE.copy()
-ytdl_opts['outtmpl'] = str(Path(download_dir) / '%(title).200s.%(ext)s')
-# keep simple (no progress hook in this blocking path)
-with YoutubeDL(ytdl_opts) as ytdl:
-info = ytdl.extract_info(url, download=False)
-formats = info.get('formats') or []
-if not formats:
-raise RuntimeError('No downloadable formats detected (possible DRM or protected stream)')
-ytdl.download([url])
-files = list(Path(download_dir).glob('*'))
-if not files:
-raise RuntimeError('Download completed but file not found')
-latest = max(files, key=lambda p: p.stat().st_mtime)
-return str(latest)
-
-
-
-
-# Minimal safe wrapper to call from async
-def download_with_ytdl_sync(url: str, download_dir: str, progress_msg: Message):
-return download_with_ytdl_sync_blocking(url, download_dir, progress_msg)
-
-
-
-
-if __name__ == '__main__':
-app.run()
+if __name__ == "__main__":
+    app.run()
