@@ -1,1 +1,5 @@
-python-telegram-bot==20.3
+pyrogram==2.0.41
+tgcrypto
+yt-dlp
+python-dotenv
+aiofiles
