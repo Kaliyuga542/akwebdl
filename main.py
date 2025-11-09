@@ -1,102 +1,76 @@
-# main.py (recommended replacement)
 import os
-import tempfile
-import asyncio
-from pathlib import Path
-from pyrogram import Client, filters
-from pyrogram.types import Message
-from yt_dlp import YoutubeDL
-from config import BOT_TOKEN, API_ID, API_HASH, OWNER_ID, MAX_FILE_SIZE_MB
+import subprocess
+from telegram import Update
+from telegram.ext import ApplicationBuilder, CommandHandler, MessageHandler, ContextTypes, filters
 
-app = Client("ott_bot",
-             bot_token=BOT_TOKEN,
-             api_id=int(API_ID),
-             api_hash=API_HASH)
+BOT_TOKEN = os.getenv("BOT_TOKEN")
+CHAT_ID = os.getenv("CHAT_ID")
 
-ALLOWED_DOMAINS = [
-    "hotstar.com", "disneyplus.com", "zee5.com", "sonyliv.com",
-    "mxplayer.in", "voot.com", "youtube.com", "youtu.be"
-]
+# Temporary user state
+user_state = {}
 
-URL_PREFIX = ("http://", "https://")
-MAX_BYTES = int(MAX_FILE_SIZE_MB) * 1024 * 1024
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("👋 Namaskara! Type /record to start recording a stream.")
 
-def is_allowed_url(url: str) -> bool:
-    return any(domain in url for domain in ALLOWED_DOMAINS)
+async def record(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    user_state[user_id] = {"step": "ask_url"}
+    await update.message.reply_text("🎥 Please send the Stream URL (m3u8/RTSP):")
 
-def yt_download_blocking(url: str, out_dir: str) -> str:
-    opts = {
-        "format": "bestvideo+bestaudio/best",
-        "outtmpl": str(Path(out_dir) / "%(title).200s.%(ext)s"),
-        "noplaylist": True,
-        "quiet": True,
-        "no_warnings": True,
-    }
-    with YoutubeDL(opts) as ydl:
-        info = ydl.extract_info(url, download=False)
-        formats = info.get("formats") or []
-        if not formats:
-            raise RuntimeError("No downloadable formats (possible DRM)")
-        ydl.download([url])
-    files = list(Path(out_dir).glob("*"))
-    if not files:
-        raise RuntimeError("Downloaded but file not found")
-    latest = max(files, key=lambda p: p.stat().st_mtime)
-    return str(latest)
+async def handle_message(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    user_id = update.effective_user.id
+    text = update.message.text
 
-@app.on_message(filters.private & filters.command(["start", "help"]))
-async def start(_, message: Message):
-    await message.reply_text(
-        "Send a direct OTT/video URL (free/non-DRM). I try to download and send the file. I cannot bypass DRM."
-    )
+    if user_id not in user_state:
+        await update.message.reply_text("❗ Please type /record first.")
+        return
 
-@app.on_message(filters.private & filters.text)
-async def handle(_, message: Message):
-    text = message.text.strip()
-    # find URL simply
-    url = None
-    for token in text.split():
-        if token.startswith(URL_PREFIX):
-            url = token
-            break
-    if not url:
-        return await message.reply_text("Please send a direct URL.")
+    step = user_state[user_id]["step"]
 
-    if not is_allowed_url(url):
-        return await message.reply_text("Domain not allowed. Add to ALLOWED_DOMAINS if needed.")
+    # Step 1: Get URL
+    if step == "ask_url":
+        user_state[user_id]["stream_url"] = text
+        user_state[user_id]["step"] = "ask_time"
+        await update.message.reply_text("⏱️ How many minutes do you want to record?")
+        return
 
-    progress = await message.reply_text("Starting download... (this may take a while)")
-    with tempfile.TemporaryDirectory() as tmp:
-        loop = asyncio.get_event_loop()
+    # Step 2: Get time
+    if step == "ask_time":
         try:
-            # Run blocking downloader in executor
-            filepath = await loop.run_in_executor(None, yt_download_blocking, url, tmp)
-        except Exception as e:
-            await progress.edit_text(f"Download failed: {e}")
+            minutes = int(text)
+        except ValueError:
+            await update.message.reply_text("⚠️ Please enter a valid number of minutes.")
             return
 
-        try:
-            size = Path(filepath).stat().st_size
-            if size > MAX_BYTES:
-                await progress.edit_text(
-                    f"File too large ({size//1024//1024} MB). Max is {MAX_FILE_SIZE_MB} MB. "
-                    "Consider external upload."
-                )
-                return
+        user_state[user_id]["duration"] = minutes
+        stream_url = user_state[user_id]["stream_url"]
 
-            await progress.edit_text("Uploading to Telegram...")
-            await app.send_document(message.chat.id, document=filepath, caption=f"From: {url}")
-            await progress.delete()
-        except Exception as e:
-            await progress.edit_text(f"Failed to send file: {e}")
+        await update.message.reply_text(f"🎬 Recording started for {minutes} minutes...")
+        output_file = f"record_{user_id}.mp4"
 
-async def main():
-    await asyncio.sleep(2)  # give time for container clock to sync
-    await app.start()
-    print("Bot started successfully ✅")
-    await idle()
-    await app.stop()
+        # Run FFmpeg command
+        subprocess.run([
+            "ffmpeg", "-y", "-i", stream_url, "-t", str(minutes * 60),
+            "-c", "copy", output_file
+        ])
+
+        # Upload video to Telegram
+        await update.message.reply_text("📤 Uploading to Telegram, please wait...")
+        from telegram import Bot
+        bot = Bot(token=BOT_TOKEN)
+        await bot.send_video(chat_id=CHAT_ID or user_id, video=open(output_file, "rb"),
+                             caption=f"✅ Recording complete ({minutes} min)")
+
+        os.remove(output_file)
+        del user_state[user_id]
+        await update.message.reply_text("✅ Done! You can type /record again if you want another.")
+
+def main():
+    app = ApplicationBuilder().token(BOT_TOKEN).build()
+    app.add_handler(CommandHandler("start", start))
+    app.add_handler(CommandHandler("record", record))
+    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, handle_message))
+    app.run_polling()
 
 if __name__ == "__main__":
-    import asyncio
-    asyncio.run(main())
+    main()
