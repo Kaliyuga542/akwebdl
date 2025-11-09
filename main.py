@@ -1,27 +1,29 @@
 #!/usr/bin/env python3
 """
-Robust Telegram Live Stream Recorder Bot (main.py)
+Telegram Live Stream Recorder Bot (MPD/m3u8) with HEADERS parsing.
 
-Features:
-- /start and /record flow: user sends stream URL and minutes
-- Uses ffmpeg with protocol_whitelist and rw_timeout
-- Tries '-c copy' first, falls back to re-encoding (libx264 + aac)
-- Async lifecycle using python-telegram-bot Application (no run_polling loop)
-- Handles telegram.error.Conflict with retry/backoff
-- Graceful shutdown on SIGINT/SIGTERM
-- Removes local recordings after successful upload
+- Exposes /health endpoint via aiohttp (for Koyeb health checks / UptimeRobot)
+- /record flow: user sends URL and optional HEADERS: block (see README)
+- FFmpeg: tries -c copy first, falls back to re-encode
+- HEADERS block syntax:
+    HEADERS:
+    Referer: https://example.com
+    User-Agent: Mozilla/5.0 ...
+    Cookie: session=abcd1234
+  (Bot will join lines with \r\n and pass to ffmpeg via -headers)
 """
 
 import os
 import asyncio
-import signal
 import logging
-from pathlib import Path
-import time
-import traceback
+import signal
 import shlex
 import subprocess
+import time
+import traceback
+from pathlib import Path
 
+from aiohttp import web
 from telegram import Bot
 from telegram.error import Conflict
 from telegram.ext import (
@@ -33,103 +35,195 @@ from telegram.ext import (
 )
 
 # -------------------------
-# Configuration & Logging
+# Configuration
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
-DEFAULT_CHAT_ID = os.getenv("CHAT_ID")  # optional: if set, uploads go there instead of user chat
+DEFAULT_CHAT_ID = os.getenv("CHAT_ID")
+PORT = int(os.getenv("PORT", "8000"))
 RECORDINGS_DIR = Path("recordings")
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
-# Backoff settings for Conflict / network issues
 INITIAL_BACKOFF = 5
 MAX_BACKOFF = 120
 
 # Logging
-logging.basicConfig(
-    level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s"
-)
-LOG = logging.getLogger("live-tv-bot")
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
+LOG = logging.getLogger("recorder-bot")
 
 # State
 SHUTDOWN = False
-user_state = {}  # simple in-memory state: {user_id: {step, stream_url, duration_minutes}}
+user_state = {}  # {user_id: {"step": ..., "stream_url": ..., "duration_minutes": ...}}
 
 # -------------------------
-# FFmpeg helpers
+# Utilities: parse HEADERS block
 # -------------------------
-def ffmpeg_cmd_copy(stream_url: str, output_path: str, duration_seconds: int):
-    return [
-        "ffmpeg",
-        "-protocol_whitelist",
-        "file,http,https,tcp,tls",
-        "-rw_timeout",
-        str(15_000_000),  # 15s
-        "-y",
-        "-i",
-        stream_url,
-        "-t",
-        str(duration_seconds),
-        "-c",
-        "copy",
-        output_path,
-    ]
+def extract_url_and_headers(text: str):
+    """
+    Parse a message that may contain a URL on first line and an optional HEADERS: block.
+    Returns (url, headers_str_or_None)
+    """
+    if not text:
+        return None, None
+    parts = text.splitlines()
+    url = None
+    headers_lines = []
+    in_headers = False
+    for raw in parts:
+        line = raw.strip()
+        if not line:
+            continue
+        upper = line.upper()
+        if upper.startswith("HEADERS:"):
+            # begin headers block
+            in_headers = True
+            remainder = line[len("HEADERS:"):].strip()
+            if remainder:
+                headers_lines.append(remainder)
+            continue
+        if in_headers:
+            headers_lines.append(line)
+        elif url is None:
+            url = line
+        else:
+            # extra lines before headers ignored
+            pass
 
+    headers_str = None
+    if headers_lines:
+        # join with \r\n and ensure trailing \r\n (ffmpeg expects CRLF line endings)
+        headers_str = "\r\n".join(headers_lines).strip() + "\r\n"
+    return url, headers_str
 
-def ffmpeg_cmd_reencode(stream_url: str, output_path: str, duration_seconds: int):
-    return [
-        "ffmpeg",
-        "-protocol_whitelist",
-        "file,http,https,tcp,tls",
-        "-rw_timeout",
-        str(15_000_000),
-        "-y",
-        "-i",
-        stream_url,
-        "-t",
-        str(duration_seconds),
-        "-c:v",
-        "libx264",
-        "-preset",
-        "veryfast",
-        "-crf",
-        "23",
-        "-c:a",
-        "aac",
-        "-b:a",
-        "128k",
-        output_path,
-    ]
+# -------------------------
+# FFmpeg helpers (MPD/DASH aware)
+# -------------------------
+def ffmpeg_cmd_copy(stream_url: str, output_path: str, duration_seconds: int, headers: str = None):
+    """
+    Construct ffmpeg command for direct copy (fast).
+    If headers provided, insert '-headers' before '-i'.
+    """
+    if headers:
+        cmd = [
+            "ffmpeg",
+            "-headers",
+            headers,
+            "-protocol_whitelist",
+            "file,http,https,tcp,tls",
+            "-rw_timeout",
+            str(15_000_000),
+            "-y",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            stream_url,
+            "-t",
+            str(duration_seconds),
+            "-c",
+            "copy",
+            output_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg",
+            "-protocol_whitelist",
+            "file,http,https,tcp,tls",
+            "-rw_timeout",
+            str(15_000_000),
+            "-y",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            stream_url,
+            "-t",
+            str(duration_seconds),
+            "-c",
+            "copy",
+            output_path,
+        ]
+    return cmd
 
+def ffmpeg_cmd_reencode(stream_url: str, output_path: str, duration_seconds: int, headers: str = None):
+    """
+    Construct ffmpeg command for re-encode fallback.
+    """
+    if headers:
+        cmd = [
+            "ffmpeg",
+            "-headers",
+            headers,
+            "-protocol_whitelist",
+            "file,http,https,tcp,tls",
+            "-rw_timeout",
+            str(15_000_000),
+            "-y",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            stream_url,
+            "-t",
+            str(duration_seconds),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            output_path,
+        ]
+    else:
+        cmd = [
+            "ffmpeg",
+            "-protocol_whitelist",
+            "file,http,https,tcp,tls",
+            "-rw_timeout",
+            str(15_000_000),
+            "-y",
+            "-use_wallclock_as_timestamps",
+            "1",
+            "-i",
+            stream_url,
+            "-t",
+            str(duration_seconds),
+            "-c:v",
+            "libx264",
+            "-preset",
+            "veryfast",
+            "-crf",
+            "23",
+            "-c:a",
+            "aac",
+            "-b:a",
+            "128k",
+            output_path,
+        ]
+    return cmd
 
 def run_subprocess_capture(cmd):
-    """
-    Run a blocking subprocess, capture stdout/stderr (text).
-    Return (returncode, stdout, stderr).
-    """
+    """Run blocking subprocess and capture output."""
     LOG.info("Running command: %s", shlex.join(cmd))
     proc = subprocess.run(cmd, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
     return proc.returncode, proc.stdout, proc.stderr
-
 
 # -------------------------
 # Telegram handlers
 # -------------------------
 async def start_handler(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(
-        "👋 Namaskara! Use /record to record a stream.\nFlow: /record → send stream URL → send minutes."
+        "👋 Namaskara! Use /record to record a stream.\nFlow: /record -> send URL (and optional HEADERS: block) -> send minutes."
     )
-
 
 async def record_handler(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
     user_id = update.effective_user.id
     user_state[user_id] = {"step": "ask_url"}
-    await update.message.reply_text("🎥 Please send the Stream URL (m3u8/RTSP/HTTP):")
-
+    await update.message.reply_text(
+        "🎥 Please send the Stream URL (mpd/m3u8/RTSP/HTTP). If the stream requires headers/cookies, append a HEADERS: block.\n\nExample:\n<url>\n\nHEADERS:\nReferer: https://example.com\nUser-Agent: Mozilla/5.0\nCookie: session=abcd"
+    )
 
 async def message_handler(update: ContextTypes.DEFAULT_TYPE, context: ContextTypes.DEFAULT_TYPE):
-    """
-    Handles user replies during /record flow.
-    """
     user_id = update.effective_user.id
     text = (update.message.text or "").strip()
 
@@ -139,12 +233,19 @@ async def message_handler(update: ContextTypes.DEFAULT_TYPE, context: ContextTyp
 
     step = user_state[user_id].get("step")
 
+    # Step: receive URL (and optional headers block) in one message
     if step == "ask_url":
-        user_state[user_id]["stream_url"] = text
+        url, headers_block = extract_url_and_headers(text)
+        if not url:
+            await update.message.reply_text("⚠️ Could not parse URL. Please send the stream URL on the first non-empty line.")
+            return
+        user_state[user_id]["stream_url"] = url
+        user_state[user_id]["headers_block"] = headers_block
         user_state[user_id]["step"] = "ask_time"
         await update.message.reply_text("⏱️ How many minutes do you want to record? (enter integer minutes)")
         return
 
+    # Step: receive duration
     if step == "ask_time":
         try:
             minutes = int(text)
@@ -154,26 +255,27 @@ async def message_handler(update: ContextTypes.DEFAULT_TYPE, context: ContextTyp
             await update.message.reply_text("⚠️ Please enter a valid positive integer for minutes.")
             return
 
+        stream_url = user_state[user_id].get("stream_url")
+        headers_block = user_state[user_id].get("headers_block")
         user_state[user_id]["duration_minutes"] = minutes
-        stream_url = user_state[user_id]["stream_url"]
-        await update.message.reply_text(f"🎬 Starting recording for {minutes} minute(s)... (stream: {stream_url})")
 
-        # prepare output path
-        timestamp = int(time.time())
-        filename = f"record_{user_id}_{timestamp}.mp4"
+        await update.message.reply_text(f"🎬 Recording started for {minutes} minute(s). Stream: {stream_url}")
+
+        # Prepare output path
+        ts = int(time.time())
+        filename = f"record_{user_id}_{ts}.mp4"
         output_path = RECORDINGS_DIR / filename
         duration_seconds = minutes * 60
 
-        # Run ffmpeg copy first (fast), fallback to re-encode
+        # Run ffmpeg copy -> re-encode fallback
         try:
             code, out, err = await asyncio.to_thread(
-                run_subprocess_capture, ffmpeg_cmd_copy(stream_url, str(output_path), duration_seconds)
+                run_subprocess_capture, ffmpeg_cmd_copy(stream_url, str(output_path), duration_seconds, headers=headers_block)
             )
         except Exception as e:
-            LOG.exception("FFmpeg copy invocation failed")
+            LOG.exception("Failed to invoke ffmpeg copy")
             await update.message.reply_text(f"❌ Recording failed to start: {e}")
             user_state.pop(user_id, None)
-            # cleanup file if exists
             try:
                 if output_path.exists():
                     output_path.unlink()
@@ -182,29 +284,35 @@ async def message_handler(update: ContextTypes.DEFAULT_TYPE, context: ContextTyp
             return
 
         if code != 0:
-            LOG.warning("ffmpeg copy failed (code %s). stderr summary: %s", code, (err or "")[:400])
-            # Try re-encode fallback
-            await update.message.reply_text("⚠️ Copy failed; trying re-encode fallback (slower)...")
-            code2, out2, err2 = await asyncio.to_thread(
-                run_subprocess_capture, ffmpeg_cmd_reencode(stream_url, str(output_path), duration_seconds)
-            )
+            LOG.warning("ffmpeg copy failed (code %s). stderr head: %s", code, (err or "")[:400])
+            await update.message.reply_text("⚠️ Fast copy failed; trying re-encode fallback (slower)...")
+            try:
+                code2, out2, err2 = await asyncio.to_thread(
+                    run_subprocess_capture, ffmpeg_cmd_reencode(stream_url, str(output_path), duration_seconds, headers=headers_block)
+                )
+            except Exception as e:
+                LOG.exception("Failed to invoke ffmpeg re-encode")
+                await update.message.reply_text(f"❌ Recording failed: {e}")
+                user_state.pop(user_id, None)
+                try:
+                    if output_path.exists():
+                        output_path.unlink()
+                except Exception:
+                    pass
+                return
+
             if code2 != 0:
-                # both failed
-                LOG.error("ffmpeg re-encode also failed. code=%s. stderr: %s", code2, (err2 or "")[:2000])
-                # send trimmed stderr to user for debugging (don't overflow)
+                LOG.error("ffmpeg re-encode failed code=%s. stderr head: %s", code2, (err2 or "")[:2000])
                 stderr_msg = (err2 or err or "No ffmpeg stderr available").strip()
-                # trim to safe length
-                if len(stderr_msg) > 1500:
-                    stderr_msg = stderr_msg[:1500] + "\n... (truncated)"
+                if len(stderr_msg) > 1400:
+                    stderr_msg = stderr_msg[:1400] + "\n...(truncated)"
                 await update.message.reply_text(f"❌ Recording failed. ffmpeg error:\n{stderr_msg}")
-                # Save full log for further debugging
                 try:
                     with open("ffmpeg_last_error.log", "w") as f:
                         f.write(err2 or err or "")
                 except Exception:
                     pass
                 user_state.pop(user_id, None)
-                # cleanup partial file
                 try:
                     if output_path.exists():
                         output_path.unlink()
@@ -216,36 +324,32 @@ async def message_handler(update: ContextTypes.DEFAULT_TYPE, context: ContextTyp
         else:
             LOG.info("ffmpeg copy succeeded.")
 
-        # Upload to Telegram
-        await update.message.reply_text("📤 Uploading the recorded file to Telegram (may take a while)...")
+        # Upload
+        await update.message.reply_text("📤 Uploading recorded file to Telegram (may take a while)...")
         bot = Bot(token=BOT_TOKEN)
         target_chat = DEFAULT_CHAT_ID or update.effective_chat.id
         try:
             with open(output_path, "rb") as f:
-                # use send_video; this may be slow for large files
                 await bot.send_video(chat_id=target_chat, video=f, caption=f"✅ Recording complete ({minutes} min)")
             await update.message.reply_text("✅ Uploaded successfully!")
         except Exception as e:
             LOG.exception("Upload failed")
-            # inform user (trim)
             msg = str(e)
             if len(msg) > 1000:
                 msg = msg[:1000] + "...(truncated)"
             await update.message.reply_text(f"❌ Upload failed: {msg}")
         finally:
-            # cleanup local file
             try:
                 if output_path.exists():
                     output_path.unlink()
             except Exception:
                 pass
 
-        # clear user state
         user_state.pop(user_id, None)
-
+        return
 
 # -------------------------
-# Application lifecycle
+# Build application and health server
 # -------------------------
 def build_application():
     app = ApplicationBuilder().token(BOT_TOKEN).build()
@@ -254,87 +358,83 @@ def build_application():
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
     return app
 
+# aiohttp health endpoint
+async def health_handler(request):
+    return web.Response(text="ok")
 
+async def start_health_server():
+    app = web.Application()
+    app.router.add_get("/health", health_handler)
+    runner = web.AppRunner(app)
+    await runner.setup()
+    site = web.TCPSite(runner, "0.0.0.0", PORT)
+    await site.start()
+    LOG.info("Health server listening on 0.0.0.0:%s", PORT)
+
+# -------------------------
+# Bot run loop (async)
+# -------------------------
 async def run_bot_loop():
-    """
-    Runs the bot inside the current asyncio event loop.
-    Handles Conflict by retrying with backoff.
-    Uses initialize/start/updater.start_polling to avoid multiple event loop close issues.
-    """
     global SHUTDOWN
-
     if not BOT_TOKEN:
         LOG.error("BOT_TOKEN not set. Exiting.")
         return
 
-    backoff = INITIAL_BACKOFF
+    # start health server so Koyeb sees the app as healthy
+    await start_health_server()
 
+    backoff = INITIAL_BACKOFF
     while not SHUTDOWN:
         app = build_application()
         try:
             LOG.info("Initializing application...")
-            await app.initialize()  # prepare internal resources
+            await app.initialize()
             LOG.info("Starting application...")
             await app.start()
             LOG.info("Starting polling...")
-            # Start polling (this returns a coroutine for updater.start_polling)
             await app.updater.start_polling()
             LOG.info("Bot polling started; entering wait loop.")
-            # keep running until shutdown requested
+            # main wait loop
             while not SHUTDOWN:
                 await asyncio.sleep(1)
             LOG.info("Shutdown requested; stopping bot.")
-            # stop polling gracefully
             await app.updater.stop()
             await app.stop()
             await app.shutdown()
-            LOG.info("Bot stopped cleanly.")
             break
-
         except Conflict as c:
-            # Another getUpdates/poller is running for same token
-            LOG.error("Conflict error from Telegram (another getUpdates running): %s", c)
-            # Increase backoff and wait, then retry
+            LOG.error("Conflict error (another getUpdates running): %s", c)
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
-            # continue to retry
         except Exception as e:
             LOG.exception("Unhandled exception in bot loop; will restart after backoff")
             await asyncio.sleep(backoff)
             backoff = min(backoff * 2, MAX_BACKOFF)
         finally:
-            # ensure we try to clean app resources if they are still running
+            # best-effort cleanup
             try:
                 if app and app.updater:
-                    # best-effort stop
-                    try:
-                        await app.updater.stop()
-                    except Exception:
-                        pass
-                if app:
-                    try:
-                        await app.stop()
-                        await app.shutdown()
-                    except Exception:
-                        pass
+                    await app.updater.stop()
+            except Exception:
+                pass
+            try:
+                await app.stop()
+                await app.shutdown()
             except Exception:
                 pass
 
     LOG.info("Exiting run_bot_loop.")
 
-
 # -------------------------
-# Signal handlers
+# Signals
 # -------------------------
-def _handle_signal(sig_num, frame):
+def _sig_handler(sig_num, frame):
     global SHUTDOWN
-    LOG.info("Signal %s received, setting shutdown flag.", sig_num)
+    LOG.info("Signal %s received; setting shutdown flag.", sig_num)
     SHUTDOWN = True
 
-
-signal.signal(signal.SIGTERM, _handle_signal)
-signal.signal(signal.SIGINT, _handle_signal)
-
+signal.signal(signal.SIGTERM, _sig_handler)
+signal.signal(signal.SIGINT, _sig_handler)
 
 # -------------------------
 # Entrypoint
