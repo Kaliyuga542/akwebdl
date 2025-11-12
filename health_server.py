@@ -7,8 +7,8 @@ Use this endpoint with UptimeRobot to keep the app alive 24x7.
 import os
 from aiohttp import web
 
-# Port provided by Koyeb (defaults to 8000)
-PORT = int(os.getenv("PORT", "8000"))
+# Port provided by Koyeb (defaults to 8080)
+PORT = int(os.getenv("PORT", "8080"))
 
 # Optional security token (so random people can’t ping it)
 EXPECTED_TOKEN = os.getenv("HEALTH_TOKEN", "secret123")
