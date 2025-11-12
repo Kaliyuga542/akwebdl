@@ -39,7 +39,7 @@ from telegram.ext import (
 # -------------------------
 BOT_TOKEN = os.getenv("BOT_TOKEN")
 DEFAULT_CHAT_ID = os.getenv("CHAT_ID")
-PORT = int(os.getenv("PORT", "8000"))
+PORT = int(os.getenv("PORT", "8080"))
 RECORDINGS_DIR = Path("recordings")
 RECORDINGS_DIR.mkdir(exist_ok=True)
 
